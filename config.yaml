@@ -1,0 +1,407 @@
+# ============================================================================
+# 家庭群健康谣言双滤网核查系统 — 集中配置
+# 原则：模型名、温度、轮数上限、阈值全部在这里；代码里不硬编码任何一项。
+# 消融实验通过 eval.configs 里的开关组合切换，不改代码。
+# ============================================================================
+
+project_name: 家庭群健康谣言双滤网核查系统
+timezone_offset_hours: 8
+
+paths:
+  db_path: data/screen.db
+  kb_path: data/kb_v2.db        # 2026-10-08 起用扩充后的库（3100 篇，D43/D45）；旧库 data/kb.db 保留作对照
+  raw_dir: data/raw
+  labeled_dir: data/labeled
+  splits_dir: data/splits
+  results_dir: results
+  figs_dir: figs
+  prompts_dir: prompts
+
+# ---------------------------------------------------------------------------
+# 本地权威知识库（检索主通道，保证可复现）
+# ---------------------------------------------------------------------------
+kb:
+  max_chars: 8000             # 单篇正文入库截断
+  min_chars: 200              # 短于此视为导航页/404，丢弃
+  per_source: 8               # 每个（关键词 × 权威域）最多取几篇
+  workers: 8                  # 正文抓取并发数（纯 HTTP，不涉及浏览器）
+  # 种子关键词；留空则用 src/kb/crawl.py 内置的 SEED_KEYWORDS
+  seed_keywords: []
+
+  # --- 切块（M4）---
+  # 整篇做检索单元太粗：一篇 3000 字的文章里可能只有一段跟当前主张相关，
+  # 整篇命中会把无关内容当证据喂给下游。切块之后证据能精确到段落。
+  chunk:
+    min_chars: 300            # 软下限：只用于"收尾短块要不要并进上一块"
+    max_chars: 500            # **硬上限**：块长严格不超过它（重叠占用本块预算）
+    overlap: 50               # 相邻块重叠字数，避免答案正好被切在边界上
+
+  # --- 向量化（M4）---
+  # 实测记录（docs/decisions.md D29）：规格原写 bge-m3，但手上这个 DashScope key
+  # **没有 bge-m3**（HTTP 404 Unsupported model），自带 text-embedding-v4（1024 维）可用。
+  # 想要字面意义的 bge-m3，把 backend 切到 local（需 pip install FlagEmbedding）。
+  # 开发/演示用本地模型（D42）；上线切回 API 只改这两段：
+  #   embed:  backend: api, model: text-embedding-v4, local_path: "", device: cpu
+  #   rerank: backend: api, model: gte-rerank-v2,     local_path: "", device: cpu
+  # 向量按「后端:模型名」分开存，两套向量可共存于同一个库；切换后补算一次向量、重跑一次评测即可。
+  embed:
+    backend: local            # api | local | none
+    model: BAAI/bge-m3        # local 时也写进向量表的 model_tag，用于区分两套向量
+    dim: 0                    # 0 = 用模型默认维度（bge-m3 / text-embedding-v4 都是 1024）
+    batch_size: 0             # 0 = 用后端默认（api 10 / local 32）
+    timeout_seconds: 60
+    max_attempts: 3
+    local_path: data/models/bge-m3     # 相对项目根；下载见 D42
+    device: cuda              # 没有显卡或没装 CUDA 版 torch 时自动退回 cpu
+
+  # --- 重排（M4）---
+  # 初检是双塔式的（query 与文档各自编码），快但精度有限；
+  # 重排用 cross-encoder 把两者拼起来打分，精度高但慢，所以只对候选 Top-N 做。
+  # 实测 gte-rerank-v2 可用；规格写的 bge-reranker 同样不在这个 key 上（D29）。
+  rerank:
+    backend: local            # api | local | none
+    model: BAAI/bge-reranker-v2-m3     # api 路：gte-rerank-v2
+    timeout_seconds: 60
+    max_attempts: 3
+    max_doc_chars: 1200       # 送进重排模型的单块截断
+    local_path: data/models/bge-reranker-v2-m3
+    device: cuda
+
+# ---------------------------------------------------------------------------
+# 模型调用（密钥从 .env 读，仓库内不出现 key）
+# ---------------------------------------------------------------------------
+llm:
+  temperature: 0.0          # 核查任务要可复现，固定 0
+  timeout_seconds: 90
+  max_attempts: 3           # 网络/限流退避重试上限
+  schema_retry: 1           # JSON/schema 校验失败后带错误信息重试次数
+  max_tokens: 4096
+  # 分模块指定模型：贵的推理模型只用在 debate，便宜的用在初筛
+  models:
+    baseline: deepseek-chat       # M2 裸模型基线；与 claim_extract 同模型才叫"公平对照"
+    query_rewrite: deepseek-chat
+    behavior_screen: deepseek-chat
+    claim_extract: deepseek-chat
+    source_score: deepseek-chat
+    debate: deepseek-chat
+    review: deepseek-chat
+    report: deepseek-chat
+  pricing:                  # 美元/百万 token，(输入, 输出)；仅用于成本估算
+    deepseek-chat: [0.28, 0.42]
+    deepseek-reasoner: [0.28, 0.42]
+    glm-4-flash: [0.0, 0.0]
+    glm-4-plus: [0.70, 0.70]
+    qwen-plus: [0.40, 1.20]
+
+# ---------------------------------------------------------------------------
+# 0. ingest —— 文章抓取
+# ---------------------------------------------------------------------------
+ingest:
+  enabled: true
+  timeout_seconds: 20
+  max_chars: 20000              # 正文截断上限，控制 token
+  # 抓不到正文时的兜底：允许用户直接粘贴正文（demo 的稳定通道）
+  allow_paste: true
+  # 公众号文章正文容器选择器（按优先级尝试）
+  article_selectors:
+    - "#js_content"
+    - "div.rich_media_content"
+    - "article"
+  # 去噪：广告与推荐阅读区块
+  noise_keywords:
+    - 广告
+    - 推荐阅读
+    - 点击关注
+    - 长按识别
+    - 往期回顾
+  video:
+    enabled: false              # 本期只做文章通道，视频留接口
+
+# ---------------------------------------------------------------------------
+# 1. behavior_screen —— 行为面滤网（第一道，不调用检索，快且便宜）
+# ---------------------------------------------------------------------------
+behavior:
+  enabled: true
+  # 行为类型定义；annotation_guide.md 为最终口径，此处供模型与代码共用
+  types:
+    转发诱导:
+      desc: 以道德绑架或利益诱导要求转发，如"转给家里老人""不转不是中国人"
+      examples: ["转给家里人看看", "不转不是中国人", "功德无量，请转发"]
+    医疗行为建议:
+      desc: 建议停药、换药、改剂量，或用偏方/保健品替代正规治疗
+      examples: ["吃了这个就不用吃降压药了", "把药停掉改喝这个", "偏方根治糖尿病"]
+    消费导流:
+      desc: 推荐购买保健品、器械、理疗服务，附购买链接、二维码或联系方式
+      examples: ["点击下方链接购买", "加微信领取体验装", "原价998今天99"]
+    金钱相关:
+      desc: 要求付费、转账、加入会员或参与理财
+      examples: ["交199元入会", "转账到指定账户", "投资这个项目稳赚"]
+    恐惧诉求:
+      desc: 夸大危害、制造紧迫感，用恐惧推动行动
+      examples: ["再不看就晚了", "已经死了好多人", "医生都不敢告诉你"]
+  # 风险等级规则（按顺序匹配，先命中先返回）
+  risk_rules:
+    - {level: 高, any_of: [医疗行为建议, 金钱相关]}
+    - {level: 中, min_hits: 2}          # 命中两类及以上其他类型
+    - {level: 低, min_hits: 1}          # 命中一类
+    - {level: 低, min_hits: 0}          # 未命中
+  confidence_threshold: 0.5              # 低于此置信度的命中不计入
+  # 正文截断上限。0 = 继承 ingest.max_chars（全链路统一规则，见 docs/decisions.md D18）
+  max_chars: 0
+
+# ---------------------------------------------------------------------------
+# 2~6. 认知面 —— claim_extract / retrieve / source_score / debate / review
+# ---------------------------------------------------------------------------
+cognitive:
+  # --- 0. 裸模型基线（M2）---
+  # 消融实验的参照基准，**不属于**认知面链路。刻意保持最小：不检索、不评分、不辩论。
+  # 它的唯一作用是把"加了检索/评分/辩论之后涨了多少"这个差值钉死。
+  baseline:
+    enabled: true
+    # 正文截断上限。0 = 继承 ingest.max_chars。
+    # 必须与链路里的抽取用同一个上限，否则 baseline 会因为"喂得少"而被人为压低，
+    # 消融出来的增益就掺了水分，站不住。
+    max_chars: 0
+  # --- 2. 事实主张抽取 ---
+  claim_extract:
+    enabled: true
+    max_claims: 5                 # 每篇最多抽 5 条
+    min_importance: 1             # 重要性 1~5，低于此值丢弃
+  # --- 3. 检索 ---
+  retrieve:
+    enabled: true
+    top_k: 5                      # 每条主张保留 Top-5 证据
+    # 查询改写：整句主张直接检索实测一律 0 结果，必须压成核心实体
+    #   llm  —— 用模型抽取核心名词短语（推荐）
+    #   rule —— 纯规则切分，不花钱但召回差
+    #   none —— 直接用原文
+    query_rewrite: llm
+    query_max_len: 18             # 规则法兜底时的最大长度
+    # 三层检索通道，按顺序尝试，凑够 top_k 即停。
+    #   kb        本地权威知识库（冻结快照，可复现）—— 主通道
+    #   site      权威站站内搜索（活检索，不可复现）—— 补 kb 未覆盖
+    #   websearch DeepSeek 官方联网搜索（活检索，不可复现）—— 最后兜底
+    # 每条证据会标记 channel，评测时单独统计"多少比例靠兜底"，把不可复现量化出来。
+    layers: [kb, websearch]          # 云端：site 层需要浏览器，去掉
+    # --- 混合检索（M4）---
+    # 两路各自可开关，对应规格要求的四行子消融：
+    #   retrieve-bm25          bm25=t, vector=f, rerank=f
+    #   retrieve-vector        bm25=f, vector=t, rerank=f
+    #   retrieve-hybrid        bm25=t, vector=t, rerank=f
+    #   retrieve-hybrid-rerank bm25=t, vector=t, rerank=t
+    # 分工：BM25 靠精确词面命中（药名、机构名、专有名词）；
+    #       向量靠语义相近（"血压偏高" vs "高血压"——实测纯 BM25 这类召回不到）。
+    hybrid:
+      bm25: true
+      vector: true
+      rerank: true
+      candidates: 20          # 初检候选数（送进重排的量）
+      rrf_k: 60               # RRF 常数，原论文推荐值
+    websearch:
+      enabled: true
+      model: deepseek-flash     # 官方联网搜索默认走 flash
+      max_uses: 3               # 单次最多搜几轮
+      max_tokens: 2048
+    # 权威来源优先；按顺序尝试，命中即用
+    authority_domains:
+      - {domain: nhc.gov.cn,        name: 国家卫生健康委员会, tier: 1}
+      - {domain: chinacdc.cn,       name: 中国疾病预防控制中心, tier: 1}
+      - {domain: piyao.org.cn,      name: 中国互联网联合辟谣平台, tier: 1}
+      - {domain: kepuchina.cn,      name: 科普中国, tier: 1}
+      - {domain: gov.cn,            name: 中国政府网, tier: 1}
+    search:
+      # backend 可选值（实测结论见 docs/decisions.md）：
+      #   browser  走 Playwright + 本机 Chrome 打权威站站内搜索，质量最高（推荐）
+      #   sogou    通用引擎 + site: 限定，能用但反爬激进，必须靠 delay_seconds 节流
+      #   bing     可直连但无视 site:，只适合通用召回，不适合"权威来源优先"
+      #   mock     返回空结果，供离线评测 / 消融对照
+      backend: mock               # 云端：没有浏览器
+      timeout_seconds: 20
+      concurrency: 1              # 浏览器后端必须串行，多开会被拦
+      results_per_query: 10
+      site_restricted: true       # 用 site: 限定权威域（Sogou 实测支持）
+      # --- 通用引擎（sogou/bing）节流 ---
+      delay_seconds: 3            # 每次请求间隔；Sogou 实测连续十几次即封 IP
+      # --- 浏览器后端 ---
+      browser_channel: chrome     # 复用本机已装 Chrome，免下载内核
+      browser_timeout_ms: 45000
+      browser_wait_ms: 4000       # 等 JS 渲染出结果的时间
+      user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    # 抓取证据正文的截断
+    evidence_max_chars: 1500
+  # --- 4. 信源评分 ---
+  source_score:
+    enabled: true
+    # 规则表可人工调整：tier -> 分数
+    tier_scores: {1: 0.95, 2: 0.8, 3: 0.6, 4: 0.35}
+    # 未登记域名按关键词兜底判断
+    keyword_rules:
+      - {match: ["gov.cn", "cdc", "卫健委", "疾控"], score: 0.9}
+      - {match: ["hospital", "三甲", "医院"], score: 0.8}
+      - {match: ["journal", "cnki", "万方", "中华医学"], score: 0.8}
+      - {match: ["people.com.cn", "xinhuanet", "cctv"], score: 0.65}
+    default_score: 0.35
+  # --- 5. 多智能体核查（M5 v2：按任务分工的辩论，见 docs/decisions.md D36）---
+  # 信源核查专家（只评证据）→ 正方/反方（各拿不同证据，只给论点）→ 裁判（唯一下结论）
+  debate:
+    enabled: true
+    max_rounds: 3                 # 规格上限：含开场陈述在内最多 3 轮
+    rounds: 2                     # 实际轮数：开场 + 1 轮反驳；一方认输即提前结束
+    adaptive_break: true          # 每轮结束后裁判决定结案或继续（D45，参考 Liang 等 EMNLP 2024）
+    gate:                         # 两阶段：先快判，没把握才辩论（省钱，也把辩论留给真正有争议的样本）
+      enabled: true               # false = 每条都辩论（出完整讨论记录时用）
+      min_confidence: 0.85        # 快判置信度低于此值 -> 辩论
+      always_debate_labels: [部分属实, 无法核查]   # 快判给出这些标签一律辩论
+    judge_runs: 1                 # 裁判独立裁决次数，多数票；平票取更严重的标签
+    judge_temperature: 0.0        # judge_runs > 1 时要调到 >0（如 0.7），否则几次结果一样，投票没意义
+    experts:                      # 正反方按主题取其中一个身份；source 是信源核查专家
+      clinical:  {name: 临床医学专家, scope: 疾病与治疗相关主张}
+      pharmacy:  {name: 药学专家,     scope: 药物、剂量、相互作用相关主张}
+      nutrition: {name: 营养学专家,   scope: 饮食、食疗、保健品相关主张}
+      source:    {name: 信源核查专家, scope: 证据是否可靠、是否被断章取义}
+  # --- 兜底（D41）：证据不可用时退回裸模型判断，结论标注「无权威证据」---
+  fallback:
+    confidence_cap: 0.6           # 无证据支撑的结论，置信度最高只给到这里
+  # --- 6. 引用核对 ---
+  # v1 的审核员（打回超限改判「无法核查」）已取消：那条出口会让谣言被无需处理（D36）。
+  # 现在 review 开关控制的是程序化引用核对：正反方引用的编号必须在该方可用证据里，
+  # 越界的剔除，一条有效引用都没有的论点标为「推测」，裁判不予采信。
+  review:
+    enabled: true
+
+# ---------------------------------------------------------------------------
+# 7. risk_matrix —— 双滤网交叉决定处置优先级
+# ---------------------------------------------------------------------------
+risk_matrix:
+  enabled: true
+  # 行=认知面（以文章中最严重的一条主张判定为准），列=行为面风险等级
+  matrix:
+    假:
+      低: 告知误区
+      中: 尽快劝阻
+      高: 尽快劝阻
+    部分属实:
+      低: 无需处理
+      中: 提醒留意
+      高: 提醒留意
+    无法核查:
+      低: 无需处理
+      中: 提醒留意
+      高: 提醒留意
+    真:
+      低: 无需处理
+      中: 无需处理
+      高: 提醒留意
+  # 认知面严重度排序：取最严重的一条
+  severity_order: [假, 部分属实, 无法核查, 真]
+
+# ---------------------------------------------------------------------------
+# 8. report —— 核查报告与辟谣稿
+# ---------------------------------------------------------------------------
+report:
+  enabled: true
+  rebuttal:
+    max_chars: 300
+    audience: 中老年读者
+    style: 口语化，先说结论，再一两句解释，最后给权威来源
+    must_end_with: 具体用药请遵医嘱      # 系统不给医疗建议
+  check_report:
+    include_evidence_chain: true
+
+# ---------------------------------------------------------------------------
+# 评测与消融配置
+# ---------------------------------------------------------------------------
+eval:
+  # 消融开关组合；--config 选一个跑
+  #
+  # 注意这里有**两条独立的轴**，别把行为面当成认知面链路上的一环：
+  #   认知面链路（纵向叠加）：baseline → +retrieve → +source → +debate → full
+  #   行为面开关（横向旁路）：behavior 只影响"处置优先级"，不改变认知面结论
+  # 所以 "+behavior" 不是链路的下一个台阶，而是给 baseline 单独接上行为面，
+  # 用来把行为面**自己的**贡献单独量出来。
+  # 等 M4/M5 完成后，最有说服力的一对是 full vs full_nobehavior（在完整链路上比较）。
+  configs:
+    baseline:
+      retrieve: false
+      source_score: false
+      debate: false
+      review: false
+      behavior: false
+    "+behavior":
+      retrieve: false
+      source_score: false
+      debate: false
+      review: false
+      behavior: true
+    "+retrieve":
+      retrieve: true
+      source_score: false
+      debate: false
+      review: false
+      behavior: false
+    "+source":
+      retrieve: true
+      source_score: true
+      debate: false
+      review: false
+      behavior: false
+    "+debate":
+      retrieve: true
+      source_score: true
+      debate: true
+      review: true
+      behavior: false
+    # 兜底（D41）：证据不可用（判为无法核查/指不出依据）时退回裸模型判断
+    "+fallback":
+      retrieve: true
+      source_score: true
+      debate: true
+      review: true
+      fallback: true
+      behavior: false
+    # full = 完整系统。2026-10-08 起包含兜底；此前的 full 结果（D38）不含兜底
+    full:
+      retrieve: true
+      source_score: true
+      debate: true
+      review: true
+      fallback: true
+      behavior: true
+
+    # --- M4 内部子消融：检索方式 ---
+    # 这几行**只变检索方式**，其余开关固定在 baseline（不评分/不辩论/不看行为面），
+    # 目的是把"检索这一层的四种做法谁更好"单独量出来，而不是混进链路整体效果里。
+    # retrieve_mode 由 eval.py 翻译成 cognitive.retrieve.hybrid 的三个开关。
+    retrieve-bm25:
+      retrieve: true
+      source_score: false
+      debate: false
+      review: false
+      behavior: false
+      retrieve_mode: bm25
+    retrieve-vector:
+      retrieve: true
+      source_score: false
+      debate: false
+      review: false
+      behavior: false
+      retrieve_mode: vector
+    retrieve-hybrid:
+      retrieve: true
+      source_score: false
+      debate: false
+      review: false
+      behavior: false
+      retrieve_mode: hybrid
+    retrieve-hybrid-rerank:
+      retrieve: true
+      source_score: false
+      debate: false
+      review: false
+      behavior: false
+      retrieve_mode: hybrid-rerank
+  # 认知面严重度阈值：部分属实判定需要证据支持度落在区间内
+  partial_truth_band: [0.35, 0.65]
+  seed: 20261002
+  # 禁止用 test 集调参：eval.py 会在 --split test 时打印警告并记录
+  forbid_test_tuning: true
