@@ -96,13 +96,45 @@ def _kb_download_url() -> str:
     return item["download_url"]
 
 
+def _download_url_with_retry(total_s: int = 180) -> str:
+    """开放接口服务是旁加载组件，与业务进程同时启动，刚启动时可能还没就绪（实测 Connection refused），
+    所以失败后每 5 秒重试，最多 3 分钟。配置类错误（没填 KB_FILEID）不重试。"""
+    deadline, last = time.time() + total_s, None
+    while True:
+        try:
+            return _kb_download_url()
+        except RuntimeError as exc:
+            if "没有配置" in str(exc):
+                raise
+            last = exc
+        except Exception as exc:                                # noqa: BLE001  连接被拒、返回非 JSON 等都重试
+            last = exc
+        if time.time() >= deadline:
+            raise RuntimeError(f"多次重试仍失败：{last}")
+        log.warning("获取知识库下载链接失败，5 秒后重试：%s", last)
+        _kb["error"] = f"重试中：{last}"
+        time.sleep(5)
+
+
+_kb_lock = threading.Lock()
+
+
 def _ensure_kb() -> None:
+    if not _kb_lock.acquire(blocking=False):                   # 已有线程在下载
+        return
+    try:
+        _ensure_kb_locked()
+    finally:
+        _kb_lock.release()
+
+
+def _ensure_kb_locked() -> None:
     if KB_PATH.exists():
-        _kb["ready"] = True
+        _kb.update(ready=True, error="")
         return
     try:
         t0 = time.time()
-        url = _kb_download_url()
+        url = _download_url_with_retry()
         KB_PATH.parent.mkdir(parents=True, exist_ok=True)
         part = KB_PATH.with_suffix(".part")
         with httpx.stream("GET", url, timeout=600, follow_redirects=True) as r:
@@ -118,7 +150,7 @@ def _ensure_kb() -> None:
             part.unlink()
         else:
             part.replace(KB_PATH)
-        _kb["ready"] = True
+        _kb.update(ready=True, error="")
         log.info("知识库就绪：%s（%.0f MB，%.1f 秒）", KB_PATH, KB_PATH.stat().st_size / 2**20, time.time() - t0)
     except Exception as exc:                                    # noqa: BLE001
         _kb["error"] = str(exc)
@@ -204,8 +236,12 @@ def _run(job_id: str, req: CheckRequest) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
     try:
-        for _ in range(120):                                    # 冷启动时等知识库下载，最多 2 分钟
-            if _kb["ready"] or _kb["error"]:
+        if not _kb["ready"] and not _kb_lock.locked():          # 之前彻底失败过：再试一次
+            threading.Thread(target=_ensure_kb, daemon=True).start()
+            time.sleep(1)
+        for _ in range(240):                                    # 冷启动时等知识库下载（含重试），最多 4 分钟
+            if _kb["ready"] or (_kb["error"] and not _kb["error"].startswith("重试中")
+                                and not _kb_lock.locked()):
                 break
             time.sleep(1)
         if not _kb["ready"]:
@@ -237,6 +273,9 @@ def _gc_jobs() -> None:
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 def health():
+    # 启动时那次彻底失败了（不是在重试中）：每次健康检查都在后台再试一次
+    if not _kb["ready"] and _kb["error"] and not _kb["error"].startswith("重试中") and not _kb_lock.locked():
+        threading.Thread(target=_ensure_kb, daemon=True).start()
     return {"status": "ok", "kb_ready": _kb["ready"], "kb_error": _kb["error"]}
 
 
