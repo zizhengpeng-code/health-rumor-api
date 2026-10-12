@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 # ---------------------------------------------------------------------------
 # 枚举（用 Literal 而非 Enum，便于直接序列化进 JSON 与 jsonl）
 # ---------------------------------------------------------------------------
-SourceType = Literal["article", "video", "paste"]
+SourceType = Literal["article", "video", "paste", "screenshot"]
 BehaviorType = Literal["转发诱导", "医疗行为建议", "消费导流", "金钱相关", "恐惧诉求"]
 RiskLevel = Literal["高", "中", "低"]
 CognitiveLabel = Literal["真", "假", "部分属实", "无法核查"]

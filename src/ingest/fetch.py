@@ -86,8 +86,34 @@ def parse_wechat(page: str) -> dict[str, str]:
     return {"title": re.sub(r"<[^>]+>", "", title).strip(), "account": account, "text": body}
 
 
+# 服务器抓不到的平台（D54）：登录墙 / 反爬 / 视频号没有公开网页。直接告诉用户改用截图或粘贴文字，
+# 不去抓一个空壳页面再给出莫名其妙的结论。
+UNSUPPORTED_PLATFORMS = {
+    "xhslink.com": "小红书", "xiaohongshu.com": "小红书",
+    "channels.weixin.qq.com": "视频号", "weixin.qq.com/sph": "视频号", "finder.video.qq.com": "视频号",
+    "douyin.com": "抖音", "iesdouyin.com": "抖音",
+    "kuaishou.com": "快手", "gifshow.com": "快手",
+}
+
+
+def extract_url(raw: str) -> str:
+    """App 里「复制链接」常带一段分享文案（如「【标题】… http://xhslink.com/xxx 复制本条信息…」），取出第一个网址。"""
+    m = re.search(r"https?://[^\s，。！？、）)】\]\"'<>]+", raw or "")
+    return m.group(0) if m else (raw or "").strip()
+
+
+def unsupported_platform(url: str) -> str:
+    low = url.lower()
+    return next((name for key, name in UNSUPPORTED_PLATFORMS.items() if key in low), "")
+
+
 def fetch_document(url: str, cfg: dict[str, Any], fetcher: Any = None) -> Document:
     """抓取链接并返回 Document。fetcher 可注入（测试用），签名 fetcher(url) -> html。"""
+    url = extract_url(url)
+    platform = unsupported_platform(url)
+    if platform:
+        raise IngestError(f"{platform}的内容无法通过链接读取（平台有登录和防抓取限制）。"
+                          f"请截图后用「上传截图」核查，或复制正文用「粘贴正文」核查。")
     icfg = cfg.get("ingest", {}) or {}
     if fetcher is None:
         import httpx

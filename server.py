@@ -54,6 +54,7 @@ from pydantic import BaseModel, Field  # noqa: E402
 
 from src.config import load_config  # noqa: E402
 from src.ingest.fetch import IngestError, fetch_document  # noqa: E402
+from src.ingest.ocr import OCRError, ocr_images  # noqa: E402
 from src.models import CheckReport, Document  # noqa: E402
 from src.report.render import PRIORITY_HINT, split_evidence, to_markdown  # noqa: E402
 
@@ -77,16 +78,23 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "P
 _kb = {"ready": KB_PATH.exists(), "error": ""}
 
 
+def _env_of(fileid: str) -> str:
+    return fileid.split("://", 1)[1].split(".", 1)[0]
+
+
 def _kb_download_url() -> str:
     if os.environ.get("KB_URL"):
         return os.environ["KB_URL"]
     fileid = os.environ.get("KB_FILEID", "")
     if not fileid:
         raise RuntimeError("没有配置 KB_FILEID 或 KB_URL")
-    env = fileid.split("://", 1)[1].split(".", 1)[0]
+    return _file_download_url(fileid)
+
+
+def _file_download_url(fileid: str) -> str:
     # 云托管内网免鉴权调用开放接口（需在控制台开启「开放接口服务」并加白 /tcb/batchdownloadfile）
     r = httpx.post("http://api.weixin.qq.com/tcb/batchdownloadfile",
-                   json={"env": env, "file_list": [{"fileid": fileid, "max_age": 3600}]}, timeout=20)
+                   json={"env": _env_of(fileid), "file_list": [{"fileid": fileid, "max_age": 600}]}, timeout=20)
     data = r.json()
     if data.get("errcode") not in (0, None):
         raise RuntimeError(f"获取下载链接失败：{data}")
@@ -199,6 +207,51 @@ def _take_quota(who: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 截图核查（D54）
+# ---------------------------------------------------------------------------
+SHOT_PREFIX = "screenshots/"
+
+
+def _check_image_ids(ids: list[str]) -> str:
+    """只接受本环境对象存储 screenshots/ 目录下的文件，防止拿后端去下载任意文件。"""
+    limit = int(((load_config().get("ingest") or {}).get("ocr") or {}).get("max_images", 3))
+    if len(ids) > limit:
+        return f"一次最多上传 {limit} 张截图"
+    kb_env = _env_of(os.environ["KB_FILEID"]) if os.environ.get("KB_FILEID") else ""
+    for f in ids:
+        if not f.startswith("cloud://") or f"/{SHOT_PREFIX}" not in f or (kb_env and _env_of(f) != kb_env):
+            return "截图地址不正确，请重新上传"
+    return ""
+
+
+def _delete_files(ids: list[str]) -> None:
+    """识别完就删：家庭群截图里可能有昵称、头像等个人信息。需加白 /tcb/batchdeletefile；失败只记日志。"""
+    try:
+        r = httpx.post("http://api.weixin.qq.com/tcb/batchdeletefile",
+                       json={"env": _env_of(ids[0]), "fileid_list": ids}, timeout=20)
+        if r.json().get("errcode") not in (0, None):
+            log.warning("删除截图失败：%s", r.text[:200])
+    except Exception as exc:                                    # noqa: BLE001
+        log.warning("删除截图失败：%s", exc)
+
+
+def _ocr_screenshots(ids: list[str], cfg) -> str:
+    try:
+        images = []
+        for f in ids:
+            r = httpx.get(_file_download_url(f), timeout=60, follow_redirects=True)
+            r.raise_for_status()
+            images.append(r.content)
+        text = ocr_images(images, cfg)
+    finally:
+        _delete_files(ids)
+    min_chars = int(((cfg.get("ingest") or {}).get("ocr") or {}).get("min_chars", 20))
+    if len(text.strip()) < min_chars:
+        raise OCRError("截图里没识别出足够的文字，请换一张更清楚、文字更完整的截图")
+    return text
+
+
+# ---------------------------------------------------------------------------
 # 任务
 # ---------------------------------------------------------------------------
 _pool = ThreadPoolExecutor(max_workers=int(os.environ.get("WORKERS", "2")))
@@ -210,6 +263,7 @@ class CheckRequest(BaseModel):
     url: str = Field(default="", description="公众号文章链接")
     text: str = Field(default="", description="文章正文（粘贴模式）")
     title: str = Field(default="", description="文章标题（可选）")
+    images: list[str] = Field(default_factory=list, description="截图在对象存储里的 fileID（截图核查，D54）")
 
 
 def report_to_dict(r: CheckReport, source_url: str = "") -> dict[str, Any]:
@@ -247,14 +301,21 @@ def _run(job_id: str, req: CheckRequest) -> None:
         if not _kb["ready"]:
             raise RuntimeError(f"知识库未就绪：{_kb['error'] or '下载超时'}")
         cfg = load_config()
-        if req.url:
+        recognized = ""
+        if req.images:
+            recognized = _ocr_screenshots(req.images, cfg)
+            doc = Document(id=f"shot-{uuid.uuid4().hex[:10]}", source_type="screenshot",
+                           title=req.title, text=recognized)
+        elif req.url:
             doc = fetch_document(req.url, cfg)
         else:
             doc = Document(id=f"paste-{uuid.uuid4().hex[:10]}", source_type="paste",
                            title=req.title, text=req.text)
         job["result"] = report_to_dict(get_checker().check(doc), source_url=req.url)
+        if recognized:
+            job["result"]["recognized_text"] = recognized[:3000]
         job["status"] = "done"
-    except IngestError as exc:
+    except (IngestError, OCRError) as exc:
         job.update(status="error", error=str(exc))
     except Exception as exc:                                    # noqa: BLE001
         traceback.print_exc()
@@ -281,8 +342,12 @@ def health():
 
 @app.post("/api/check")
 def submit(req: CheckRequest, request: Request):
-    if not req.url and not req.text:
-        return {"ok": False, "error": "请输入文章链接或粘贴正文"}
+    if not req.url and not req.text and not req.images:
+        return {"ok": False, "error": "请输入文章链接、粘贴正文或上传截图"}
+    if req.images:
+        bad = _check_image_ids(req.images)
+        if bad:
+            return {"ok": False, "error": bad}
     if req.text and len(req.text.strip()) < 50:
         return {"ok": False, "error": "正文太短，请粘贴完整内容（至少 50 字）"}
     openid = request.headers.get("x-wx-openid", "")

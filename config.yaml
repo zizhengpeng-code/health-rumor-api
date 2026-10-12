@@ -102,6 +102,13 @@ ingest:
   max_chars: 20000              # 正文截断上限，控制 token
   # 抓不到正文时的兜底：允许用户直接粘贴正文（demo 的稳定通道）
   allow_paste: true
+  # 截图核查（D54）：小红书 / 视频号 / 抖音 / 朋友圈等抓不到的内容，用户截图后识别文字
+  ocr:
+    model: qwen-vl-ocr          # 阿里云百炼专用 OCR 模型，与向量检索共用百炼密钥
+    max_images: 3               # 一次最多几张（长笔记、长图分几屏截）
+    max_mb: 10                  # 单张上限
+    timeout_seconds: 60
+    min_chars: 20               # 识别出的字少于这个数，提示用户换一张更清楚的截图
   # 公众号文章正文容器选择器（按优先级尝试）
   article_selectors:
     - "#js_content"
